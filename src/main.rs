@@ -26,6 +26,10 @@ enum Commands {
         /// Listen port (default: 12345)
         #[arg(short, long, default_value_t = 12345)]
         port: u16,
+        
+        /// Enable TUI interface
+        #[arg(long, default_value_t = false)]
+        tui: bool,
     },
     /// Connect to chat server
     Client {
@@ -47,8 +51,8 @@ async fn main() {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Server { address, port } => {
-            server::run_server(&address, port).await;
+        Commands::Server { address, port, tui } => {
+            server::run_server(&address, port, tui).await;
         }
         Commands::Client { name, address, port } => {
             client::run_client(&name, &address, port).await;

@@ -16,7 +16,7 @@ pub async fn run_client(name: &str, server_address: &str, server_port: u16) {
     
     thread::spawn(move || {
         loop {
-            match reqwest::blocking::get(&format!("{}/room/1", server_url_clone)) {
+            match reqwest::blocking::get(&format!("{}/messages", server_url_clone)) {
                 Ok(mut resp) => {
                     let mut t = term::stdout().unwrap();
                     
