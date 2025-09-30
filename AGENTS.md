@@ -2,7 +2,8 @@
 
 ## Build/Lint/Test Commands
 - Build: `cargo build`
-- Run: `cargo run [name]`
+- Run server: `cargo run server [-a ADDRESS] [-p PORT]`
+- Run client: `cargo run client <name> [-a ADDRESS] [-p PORT]`
 - Test: `cargo test`
 - Lint: `cargo clippy`
 - Format: `cargo fmt`
