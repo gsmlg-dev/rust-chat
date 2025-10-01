@@ -9,52 +9,49 @@ use axum::{
     routing::{get, post},
 };
 use futures::{sink::SinkExt, stream::StreamExt};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub text: String,
-}
+use crate::shared::{Message, UserList, SerializableUser, User, ClientMessage, ServerMessage, ChatError, ChatResult};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserList {
-    pub users: Vec<SerializableUser>,
-    pub count: usize,
-}
+/// Maximum number of messages to keep in memory
+const MAX_MESSAGES: usize = 1000;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializableUser {
-    pub name: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct User {
-    #[allow(dead_code)]
-    pub id: String,
-    pub name: String,
-    pub connected_at: Instant,
-}
-
-impl From<&User> for SerializableUser {
-    fn from(user: &User) -> Self {
-        SerializableUser {
-            name: user.name.clone(),
-        }
-    }
-}
-
+/// Represents the shared application state for the chat server.
+/// 
+/// This struct contains all the data that needs to be shared across
+/// different async tasks and WebSocket connections.
 #[derive(Clone)]
 pub struct AppState {
+    /// Stores the chat message history
     pub messages: Arc<Mutex<Vec<Message>>>,
+    /// List of active WebSocket client connections
     pub clients: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Message>>>>,
+    /// Mapping of user IDs to user information
     pub users: Arc<Mutex<HashMap<String, User>>>,
 }
 
-pub async fn run_server(address: &str, port: u16, tui: bool) {
+/// Starts the chat server with the specified configuration.
+/// 
+/// # Arguments
+/// 
+/// * `address` - The IP address to bind the server to (e.g., "127.0.0.1")
+/// * `port` - The port number to listen on (e.g., 12345)
+/// * `tui` - Whether to enable the terminal user interface
+/// 
+/// # Returns
+/// 
+/// Returns `Ok(())` if the server starts successfully, or an error if binding fails.
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// // Start server on localhost:12345 without TUI
+/// run_server("127.0.0.1", 12345, false).await?;
+/// ```
+pub async fn run_server(address: &str, port: u16, tui: bool) -> ChatResult<()> {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let clients = Arc::new(Mutex::new(Vec::new()));
     let users = Arc::new(Mutex::new(HashMap::new()));
@@ -69,7 +66,7 @@ pub async fn run_server(address: &str, port: u16, tui: bool) {
 
     if tui {
         println!("Chat server running on http://{} with TUI", socket_addr);
-        run_tui_server(app_state.clone(), socket_addr).await;
+        run_tui_server(app_state.clone(), socket_addr).await?;
     } else {
         println!("Chat server running on http://{}", socket_addr);
         let app = Router::new()
@@ -77,11 +74,33 @@ pub async fn run_server(address: &str, port: u16, tui: bool) {
             .route("/room/1", post(handle_post))
             .route("/messages", get(handle_get))
             .with_state(app_state);
-        let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind(socket_addr)
+            .await
+            .map_err(|e| ChatError::NetworkError(format!("Failed to bind to {}: {}", socket_addr, e)))?;
+        
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("Server error: {}", e);
+            return Err(ChatError::NetworkError(format!("Server runtime error: {}", e)));
+        }
     }
+    
+    Ok(())
 }
 
+/// Handles WebSocket upgrade requests for the chat endpoint.
+/// 
+/// This function is called when a client attempts to upgrade their HTTP
+/// connection to a WebSocket connection for real-time chat.
+/// 
+/// # Arguments
+/// 
+/// * `ws` - The WebSocket upgrade request from axum
+/// * `state` - The shared application state
+/// 
+/// # Returns
+/// 
+/// Returns a response that upgrades the connection to WebSocket.
 async fn handle_websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -89,25 +108,44 @@ async fn handle_websocket(
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+/// Handles the actual WebSocket connection after upgrade.
+/// 
+/// This function manages the bidirectional communication with a connected
+/// client, processing incoming messages and broadcasting outgoing messages.
+/// 
+/// # Arguments
+/// 
+/// * `socket` - The upgraded WebSocket connection
+/// * `state` - The shared application state
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // First, wait for a message with the user's name
+    // First, wait for a connection message with the user's name
     let user_name = match receiver.next().await {
         Some(Ok(axum::extract::ws::Message::Text(text))) => {
-            if let Ok(msg) = serde_json::from_str::<Message>(&text) {
-                // Extract name from "Name: message" format
-                if let Some(colon_pos) = msg.text.find(':') {
-                    msg.text[..colon_pos].to_string()
-                } else {
-                    msg.text
+            if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                match client_msg {
+                    ClientMessage::Connect { name } => name,
+                    _ => format!(
+                        "User_{}",
+                        uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
+                    ),
                 }
             } else {
-                format!(
-                    "User_{}",
-                    uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
-                )
+                // Fallback for old format - extract name from "Name: message" format
+                if let Ok(msg) = serde_json::from_str::<Message>(&text) {
+                    if let Some(colon_pos) = msg.text.find(':') {
+                        msg.text[..colon_pos].to_string()
+                    } else {
+                        msg.text
+                    }
+                } else {
+                    format!(
+                        "User_{}",
+                        uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
+                    )
+                }
             }
         }
         _ => format!(
@@ -118,13 +156,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Generate a unique user ID
     let user_id = uuid::Uuid::new_v4().to_string();
-    let user = User {
-        id: user_id.clone(),
-        name: user_name.clone(),
-        connected_at: Instant::now(),
-    };
+    let user = User::new(user_name.clone());
 
     // Add this client to list
+    if let Err(e) = state.clients.lock() {
+        eprintln!("Failed to acquire clients lock: {}", e);
+        return;
+    }
     state.clients.lock().unwrap().push(tx);
 
     // Add user to tracking
@@ -154,26 +192,69 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Send user list to all clients
     broadcast_user_list(&state).await;
+    
+    // Broadcast user joined notification
+    broadcast_user_joined(&state, &user_name).await;
 
     // Handle incoming messages from this client
     let state_clone = state.clone();
+    let user_name_clone = user_name.clone();
     let recv_task = async {
         while let Some(msg) = receiver.next().await {
             if let Ok(axum::extract::ws::Message::Text(text)) = msg {
-                let message = Message {
-                    text: text.to_string(),
-                };
+                // Try to parse as ClientMessage
+                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                    match client_msg {
+                        ClientMessage::Chat { text: chat_text } => {
+                            let message = Message::chat_message(&user_name_clone, &chat_text);
 
-                // Store message
-                {
-                    let mut messages = state_clone.messages.lock().unwrap();
-                    messages.push(message.clone());
-                }
+                    // Store message with limit
+                    {
+                        let mut messages = state_clone.messages.lock().unwrap();
+                        
+                        // First check if we need to remove old messages
+                        let needs_trimming = messages.len() >= MAX_MESSAGES;
+                        
+                        // Add the new message
+                        messages.push(message.clone());
+                        
+                        // Remove oldest message if we exceeded the limit
+                        if needs_trimming {
+                            messages.remove(0);
+                        }
+                    }
 
-                // Broadcast to all clients
-                let clients = state_clone.clients.lock().unwrap();
-                for client_tx in clients.iter() {
-                    let _ = client_tx.send(message.clone());
+                            // Broadcast to all clients
+                            let server_msg = ServerMessage::Chat { text: message.text };
+                            broadcast_server_message(&state_clone, &server_msg).await;
+                        }
+                        ClientMessage::Disconnect => {
+                            break;
+                        }
+                        ClientMessage::Connect { .. } => {
+                            // Ignore duplicate connect messages
+                        }
+                    }
+                } else {
+                    // Fallback for old message format
+                    let message = Message { text: text.to_string() };
+
+                    // Store message with limit
+                    {
+                        let mut messages = state_clone.messages.lock().unwrap();
+                        messages.push(message.clone());
+                        
+                        // Remove oldest messages if we exceed the limit
+                        while messages.len() > MAX_MESSAGES {
+                            messages.remove(0);
+                        }
+                    }
+
+                    // Broadcast to all clients
+                    let clients = state_clone.clients.lock().unwrap();
+                    for client_tx in clients.iter() {
+                        let _ = client_tx.send(message.clone());
+                    }
                 }
             }
         }
@@ -203,8 +284,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let mut users = state.users.lock().unwrap();
         users.remove(&user_id);
     }
+    
+    // Broadcast user left notification
+    broadcast_user_left(&state, &user_name).await;
 }
 
+/// Handles GET requests to retrieve all chat messages.
+/// 
+/// This endpoint returns the complete message history as plain text,
+/// with each message on a new line.
+/// 
+/// # Arguments
+/// 
+/// * `state` - The shared application state containing the messages
+/// 
+/// # Returns
+/// 
+/// Returns a response with status 200 OK containing the message history.
 async fn handle_get(State(state): State<AppState>) -> impl IntoResponse {
     let messages = state.messages.lock().unwrap();
     let response: String = messages
@@ -215,12 +311,31 @@ async fn handle_get(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, response)
 }
 
+/// Handles POST requests to add new chat messages.
+/// 
+/// This endpoint accepts JSON messages, stores them in the message history,
+/// enforces the message limit, and broadcasts them to all connected WebSocket clients.
+/// 
+/// # Arguments
+/// 
+/// * `state` - The shared application state
+/// * `message` - The message to add, extracted from the JSON request body
+/// 
+/// # Returns
+/// 
+/// Returns status 201 CREATED if the message is successfully processed.
 async fn handle_post(
     State(state): State<AppState>,
     Json(message): Json<Message>,
 ) -> impl IntoResponse {
     let mut messages = state.messages.lock().unwrap();
     messages.push(message.clone());
+    
+    // Remove oldest messages if we exceed the limit
+    if messages.len() > MAX_MESSAGES {
+        let drain_end = messages.len() - MAX_MESSAGES;
+        messages.drain(0..drain_end);
+    }
 
     // Broadcast to all WebSocket clients
     let clients = state.clients.lock().unwrap();
@@ -231,8 +346,10 @@ async fn handle_post(
     StatusCode::CREATED
 }
 
-async fn run_tui_server(state: AppState, socket_addr: SocketAddr) {
-    let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
+async fn run_tui_server(state: AppState, socket_addr: SocketAddr) -> ChatResult<()> {
+    let listener = tokio::net::TcpListener::bind(socket_addr)
+        .await
+        .map_err(|e| ChatError::NetworkError(format!("Failed to bind to {}: {}", socket_addr, e)))?;
     let state_clone = state.clone();
 
     // Start the server in a separate task
@@ -255,19 +372,32 @@ async fn run_tui_server(state: AppState, socket_addr: SocketAddr) {
 
     // Cancel server task
     server_handle.abort();
+    
+    Ok(())
 }
 
 async fn broadcast_user_list(state: &AppState) {
     let user_list = {
         let users = state.users.lock().unwrap();
-        let serializable_users: Vec<SerializableUser> = users.values().map(|u| u.into()).collect();
-        UserList {
-            users: serializable_users,
-            count: users.len(),
-        }
+        UserList::from_users(&users.values().cloned().collect::<Vec<_>>())
     };
 
-    let json = serde_json::to_string(&user_list).expect("Failed to serialize user list");
+    let server_msg = ServerMessage::UserList(user_list);
+    broadcast_server_message(state, &server_msg).await;
+}
+
+async fn broadcast_user_joined(state: &AppState, user_name: &str) {
+    let server_msg = ServerMessage::UserJoined { name: user_name.to_string() };
+    broadcast_server_message(state, &server_msg).await;
+}
+
+async fn broadcast_user_left(state: &AppState, user_name: &str) {
+    let server_msg = ServerMessage::UserLeft { name: user_name.to_string() };
+    broadcast_server_message(state, &server_msg).await;
+}
+
+async fn broadcast_server_message(state: &AppState, server_msg: &ServerMessage) {
+    let json = serde_json::to_string(server_msg).expect("Failed to serialize server message");
     let message = Message { text: json };
 
     let clients = state.clients.lock().unwrap();

@@ -1,28 +1,33 @@
 use futures::{sink::SinkExt, stream::StreamExt};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub text: String,
-}
+use crate::shared::{Message, UserList, ClientMessage, ServerMessage, ChatError, ChatResult};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserList {
-    pub users: Vec<User>,
-    pub count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct User {
-    pub name: String,
-}
-
+/// Runs the chat client and connects to the specified server.
+/// 
+/// This function establishes a WebSocket connection to the chat server,
+/// handles user input, and displays incoming messages in real-time.
+/// 
+/// # Arguments
+/// 
+/// * `server_address` - The IP address or hostname of the chat server
+/// * `server_port` - The port number the server is listening on
+/// * `name` - Optional username for the client. If None, a random name is generated.
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// // Connect with a specific name
+/// run_client("127.0.0.1", 12345, Some("Alice".to_string())).await;
+/// 
+/// // Connect with a random name
+/// run_client("127.0.0.1", 12345, None).await;
+/// ```
 pub async fn run_client(server_address: &str, server_port: u16, name: Option<String>) {
     let client_name = name.unwrap_or_else(generate_random_name);
     let ws_url = format!("ws://{}:{}/room/1", server_address, server_port);
@@ -37,15 +42,21 @@ pub async fn run_client(server_address: &str, server_port: u16, name: Option<Str
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
+    // Send initial connection message with user name
+    let connect_msg = ClientMessage::Connect { name: client_name.clone() };
+    let json = serde_json::to_string(&connect_msg).expect("Failed to serialize connect message");
+    ws_sender
+        .send(WsMessage::Text(json.into()))
+        .await
+        .expect("Failed to send connect message");
+
     let _tx_clone = tx.clone();
     let client_name_clone = client_name.clone();
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let message = Message {
-                text: format!("{}: {}", client_name_clone, msg),
-            };
-            let json = serde_json::to_string(&message).expect("Failed to serialize message");
+            let chat_msg = ClientMessage::Chat { text: msg };
+            let json = serde_json::to_string(&chat_msg).expect("Failed to serialize chat message");
             ws_sender
                 .send(WsMessage::Text(json.into()))
                 .await
@@ -58,18 +69,40 @@ pub async fn run_client(server_address: &str, server_port: u16, name: Option<Str
         while let Some(msg) = ws_receiver.next().await {
             match msg {
                 Ok(WsMessage::Text(text)) => {
-                    // Try to parse as user list first
-                    if let Ok(user_list) = serde_json::from_str::<UserList>(&text) {
-                        let mut t = term::stdout().unwrap();
-                        t.fg(term::color::BLUE).unwrap();
-                        writeln!(t, "=== Users online: {} ===", user_list.count).unwrap();
-                        for user in user_list.users {
-                            writeln!(t, "  {}", user.name).unwrap();
+                    // Try to parse as ServerMessage
+                    if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                        match server_msg {
+                            ServerMessage::Chat { text } => {
+                                let mut t = term::stdout().unwrap();
+                                t.fg(term::color::GREEN).unwrap();
+                                writeln!(t, "{}", text).unwrap();
+                                t.reset().unwrap();
+                            }
+                            ServerMessage::UserList(user_list) => {
+                                let mut t = term::stdout().unwrap();
+                                t.fg(term::color::BLUE).unwrap();
+                                writeln!(t, "=== Users online: {} ===", user_list.count).unwrap();
+                                for user in user_list.users {
+                                    writeln!(t, "  {}", user.name).unwrap();
+                                }
+                                writeln!(t, "========================").unwrap();
+                                t.reset().unwrap();
+                            }
+                            ServerMessage::UserJoined { name } => {
+                                let mut t = term::stdout().unwrap();
+                                t.fg(term::color::YELLOW).unwrap();
+                                writeln!(t, "*** {} joined the chat ***", name).unwrap();
+                                t.reset().unwrap();
+                            }
+                            ServerMessage::UserLeft { name } => {
+                                let mut t = term::stdout().unwrap();
+                                t.fg(term::color::YELLOW).unwrap();
+                                writeln!(t, "*** {} left the chat ***", name).unwrap();
+                                t.reset().unwrap();
+                            }
                         }
-                        writeln!(t, "========================").unwrap();
-                        t.reset().unwrap();
                     } else {
-                        // Regular chat message
+                        // Fallback for old message format
                         let mut t = term::stdout().unwrap();
                         t.fg(term::color::GREEN).unwrap();
                         writeln!(t, "{}", text).unwrap();

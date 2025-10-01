@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod client;
 mod server;
+mod shared;
 
 #[derive(Parser)]
 #[command(name = "chat")]
@@ -53,7 +54,10 @@ async fn main() {
 
     match cli.command {
         Commands::Server { address, port, tui } => {
-            server::run_server(&address, port, tui).await;
+            if let Err(e) = server::run_server(&address, port, tui).await {
+                eprintln!("Server error: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::Client {
             address,
