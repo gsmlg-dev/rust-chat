@@ -95,6 +95,7 @@ pub async fn run_client(name: &str, server_address: &str, server_port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::{get, post};
 
     #[tokio::test]
     async fn test_message_serialization() {
@@ -219,5 +220,199 @@ mod tests {
         whom.push_str(": ");
         whom.push_str(line);
         assert_eq!(whom, "User@123: Hello");
+    }
+
+    #[tokio::test]
+    async fn test_client_connect_to_server() {
+        let address = "127.0.0.1";
+        let port = 12348; // Use different port
+        let server_url = format!("http://{}:{}", address, port);
+        
+        // Start a mock server
+        let server_handle = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route("/messages", get(|| async { "No messages yet\n" }))
+                .route("/room/1", post(|| async { axum::http::StatusCode::CREATED }));
+                
+            let listener = tokio::net::TcpListener::bind(format!("{}:{}", address, port))
+                .await
+                .unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+        
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Test client connection by making HTTP requests
+        let client = reqwest::Client::new();
+        
+        // Test GET messages endpoint
+        let response = client.get(&format!("{}/messages", server_url))
+            .send()
+            .await;
+            
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert!(response.status().is_success());
+        
+        // Test POST message endpoint
+        let message = Message {
+            text: "TestClient: Hello".to_string(),
+        };
+        
+        let response = client.post(&format!("{}/room/1", server_url))
+            .json(&message)
+            .send()
+            .await;
+            
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        
+        // Stop server
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_client_disconnect_handling() {
+        let address = "127.0.0.1";
+        let port = 12349; // Use different port
+        let server_url = format!("http://{}:{}", address, port);
+        
+        // Start a mock server that tracks connections
+        let server_handle = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route("/messages", get(|| async { "Test messages\n" }))
+                .route("/room/1", post(|| async { axum::http::StatusCode::CREATED }));
+                
+            let listener = tokio::net::TcpListener::bind(format!("{}:{}", address, port))
+                .await
+                .unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+        
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        let client = reqwest::Client::new();
+        
+        // Simulate client connecting and making requests
+        for _i in 0..3 {
+            let response = client.get(&format!("{}/messages", server_url))
+                .send()
+                .await;
+                
+            assert!(response.is_ok());
+            assert!(response.unwrap().status().is_success());
+            
+            // Small delay between requests
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        
+        // Simulate disconnection by dropping the client
+        drop(client);
+        
+        // Give time for connection to be fully closed
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Create new client to verify server is still running
+        let new_client = reqwest::Client::new();
+        let response = new_client.get(&format!("{}/messages", server_url))
+            .send()
+            .await;
+            
+        assert!(response.is_ok());
+        assert!(response.unwrap().status().is_success());
+        
+        // Stop server
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_client_connection_error_handling() {
+        let address = "127.0.0.1";
+        let port = 12350; // Use port that won't have a server running
+        let server_url = format!("http://{}:{}", address, port);
+        
+        let client = reqwest::Client::new();
+        
+        // Test connection to non-existent server
+        let response = client.get(&format!("{}/messages", server_url))
+            .send()
+            .await;
+            
+        assert!(response.is_err());
+        
+        // Test POST to non-existent server
+        let message = Message {
+            text: "TestClient: Hello".to_string(),
+        };
+        
+        let response = client.post(&format!("{}/room/1", server_url))
+            .json(&message)
+            .send()
+            .await;
+            
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_client_multiple_connections() {
+        let address = "127.0.0.1";
+        let port = 12351; // Use different port
+        let server_url = format!("http://{}:{}", address, port);
+        
+        // Start a mock server
+        let server_handle = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route("/messages", get(|| async { "Server messages\n" }))
+                .route("/room/1", post(|| async { axum::http::StatusCode::CREATED }));
+                
+            let listener = tokio::net::TcpListener::bind(format!("{}:{}", address, port))
+                .await
+                .unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+        
+        // Give server time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Create multiple clients
+        let client1 = reqwest::Client::new();
+        let client2 = reqwest::Client::new();
+        let client3 = reqwest::Client::new();
+        
+        // All clients should be able to connect
+        let response1 = client1.get(&format!("{}/messages", server_url)).send().await;
+        let response2 = client2.get(&format!("{}/messages", server_url)).send().await;
+        let response3 = client3.get(&format!("{}/messages", server_url)).send().await;
+        
+        assert!(response1.is_ok());
+        assert!(response2.is_ok());
+        assert!(response3.is_ok());
+        
+        assert!(response1.unwrap().status().is_success());
+        assert!(response2.unwrap().status().is_success());
+        assert!(response3.unwrap().status().is_success());
+        
+        // All clients should be able to post messages
+        let message1 = Message { text: "Client1: Hello".to_string() };
+        let message2 = Message { text: "Client2: Hello".to_string() };
+        let message3 = Message { text: "Client3: Hello".to_string() };
+        
+        let post1 = client1.post(&format!("{}/room/1", server_url)).json(&message1).send().await;
+        let post2 = client2.post(&format!("{}/room/1", server_url)).json(&message2).send().await;
+        let post3 = client3.post(&format!("{}/room/1", server_url)).json(&message3).send().await;
+        
+        assert!(post1.is_ok());
+        assert!(post2.is_ok());
+        assert!(post3.is_ok());
+        
+        assert_eq!(post1.unwrap().status(), reqwest::StatusCode::CREATED);
+        assert_eq!(post2.unwrap().status(), reqwest::StatusCode::CREATED);
+        assert_eq!(post3.unwrap().status(), reqwest::StatusCode::CREATED);
+        
+        // Stop server
+        server_handle.abort();
     }
 }

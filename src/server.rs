@@ -460,4 +460,116 @@ mod tests {
         assert!(duration.as_millis() >= 5);
         assert!(duration.as_millis() <= 50); // Allow some margin for timing variations
     }
+
+    #[tokio::test]
+    async fn test_server_start_and_stop() {
+        let address = "127.0.0.1";
+        let port = 12346; // Use different port to avoid conflicts
+        let server_url = format!("http://{}:{}", address, port);
+        
+        // Start server in background
+        let server_handle = tokio::spawn(async move {
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let clients = Arc::new(Mutex::new(Vec::new()));
+            let users = Arc::new(Mutex::new(HashMap::new()));
+            let app_state = AppState { messages, clients, users };
+            
+            let socket_addr: SocketAddr = format!("{}:{}", address, port).parse().unwrap();
+            let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
+            
+            let app = Router::new()
+                .route("/room/1", get(handle_websocket))
+                .route("/room/1", post(handle_post))
+                .route("/messages", get(handle_get))
+                .with_state(app_state);
+                
+            axum::serve(listener, app).await.unwrap();
+        });
+        
+        // Give server time to start
+        sleep(Duration::from_millis(100)).await;
+        
+        // Test that server is responding
+        let client = reqwest::Client::new();
+        let response = client.get(&format!("{}/messages", server_url))
+            .send()
+            .await;
+            
+        assert!(response.is_ok());
+        assert!(response.unwrap().status().is_success());
+        
+        // Stop server by aborting the task
+        server_handle.abort();
+        
+        // Give server time to stop
+        sleep(Duration::from_millis(100)).await;
+        
+        // Test that server is no longer responding
+        let response = client.get(&format!("{}/messages", server_url))
+            .send()
+            .await;
+            
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_server_with_multiple_clients() {
+        let address = "127.0.0.1";
+        let port = 12347; // Use different port
+        let server_url = format!("http://{}:{}", address, port);
+        
+        // Start server in background
+        let server_handle = tokio::spawn(async move {
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let clients = Arc::new(Mutex::new(Vec::new()));
+            let users = Arc::new(Mutex::new(HashMap::new()));
+            let app_state = AppState { messages, clients, users };
+            
+            let socket_addr: SocketAddr = format!("{}:{}", address, port).parse().unwrap();
+            let listener = tokio::net::TcpListener::bind(socket_addr).await.unwrap();
+            
+            let app = Router::new()
+                .route("/room/1", get(handle_websocket))
+                .route("/room/1", post(handle_post))
+                .route("/messages", get(handle_get))
+                .with_state(app_state);
+                
+            axum::serve(listener, app).await.unwrap();
+        });
+        
+        // Give server time to start
+        sleep(Duration::from_millis(100)).await;
+        
+        let client = reqwest::Client::new();
+        
+        // Test multiple client connections via HTTP endpoints
+        for i in 0..3 {
+            let message = Message {
+                text: format!("Client {} message", i),
+            };
+            
+            let response = client.post(&format!("{}/room/1", server_url))
+                .json(&message)
+                .send()
+                .await;
+                
+            assert!(response.is_ok());
+            assert!(response.unwrap().status().is_success());
+        }
+        
+        // Verify messages were stored
+        let response = client.get(&format!("{}/messages", server_url))
+            .send()
+            .await
+            .unwrap();
+            
+        assert!(response.status().is_success());
+        let content = response.text().await.unwrap();
+        assert!(content.contains("Client 0 message"));
+        assert!(content.contains("Client 1 message"));
+        assert!(content.contains("Client 2 message"));
+        
+        // Stop server
+        server_handle.abort();
+    }
 }
