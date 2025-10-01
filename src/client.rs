@@ -148,7 +148,7 @@ async fn run_chat_tui(tx: mpsc::UnboundedSender<String>, client_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use url::Url;
 
     #[tokio::test]
