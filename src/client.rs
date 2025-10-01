@@ -148,7 +148,8 @@ async fn run_chat_tui(tx: mpsc::UnboundedSender<String>, client_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::{get, post};
+    
+    use url::Url;
 
     #[tokio::test]
     async fn test_message_serialization() {
