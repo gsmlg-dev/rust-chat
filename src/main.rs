@@ -33,9 +33,6 @@ enum Commands {
     },
     /// Connect to chat server
     Client {
-        /// Your chat name
-        name: String,
-
         /// Server address (default: 127.0.0.1)
         #[arg(short, long, default_value = "127.0.0.1")]
         address: String,
@@ -43,6 +40,10 @@ enum Commands {
         /// Server port (default: 12345)
         #[arg(short, long, default_value_t = 12345)]
         port: u16,
+
+        /// Your chat name (optional, random if not provided)
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -55,11 +56,11 @@ async fn main() {
             server::run_server(&address, port, tui).await;
         }
         Commands::Client {
-            name,
             address,
             port,
+            name,
         } => {
-            client::run_client(&name, &address, port).await;
+            client::run_client(&address, port, name).await;
         }
     }
 }

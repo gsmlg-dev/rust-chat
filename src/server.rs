@@ -20,12 +20,31 @@ pub struct Message {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserList {
+    pub users: Vec<SerializableUser>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableUser {
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct User {
     #[allow(dead_code)]
     pub id: String,
     pub name: String,
     pub connected_at: Instant,
+}
+
+impl From<&User> for SerializableUser {
+    fn from(user: &User) -> Self {
+        SerializableUser {
+            name: user.name.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -74,11 +93,34 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // First, wait for a message with the user's name
+    let user_name = match receiver.next().await {
+        Some(Ok(axum::extract::ws::Message::Text(text))) => {
+            if let Ok(msg) = serde_json::from_str::<Message>(&text) {
+                // Extract name from "Name: message" format
+                if let Some(colon_pos) = msg.text.find(':') {
+                    msg.text[..colon_pos].to_string()
+                } else {
+                    msg.text
+                }
+            } else {
+                format!(
+                    "User_{}",
+                    uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
+                )
+            }
+        }
+        _ => format!(
+            "User_{}",
+            uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
+        ),
+    };
+
     // Generate a unique user ID
     let user_id = uuid::Uuid::new_v4().to_string();
     let user = User {
         id: user_id.clone(),
-        name: format!("User_{}", user_id.split('-').next().unwrap()),
+        name: user_name.clone(),
         connected_at: Instant::now(),
     };
 
@@ -109,6 +151,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             return;
         }
     }
+
+    // Send user list to all clients
+    broadcast_user_list(&state).await;
 
     // Handle incoming messages from this client
     let state_clone = state.clone();
@@ -210,6 +255,25 @@ async fn run_tui_server(state: AppState, socket_addr: SocketAddr) {
 
     // Cancel server task
     server_handle.abort();
+}
+
+async fn broadcast_user_list(state: &AppState) {
+    let user_list = {
+        let users = state.users.lock().unwrap();
+        let serializable_users: Vec<SerializableUser> = users.values().map(|u| u.into()).collect();
+        UserList {
+            users: serializable_users,
+            count: users.len(),
+        }
+    };
+
+    let json = serde_json::to_string(&user_list).expect("Failed to serialize user list");
+    let message = Message { text: json };
+
+    let clients = state.clients.lock().unwrap();
+    for client_tx in clients.iter() {
+        let _ = client_tx.send(message.clone());
+    }
 }
 
 async fn run_tui(state: AppState) -> Result<(), Box<dyn std::error::Error>> {

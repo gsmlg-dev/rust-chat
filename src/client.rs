@@ -1,90 +1,140 @@
+use futures::{sink::SinkExt, stream::StreamExt};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::thread;
+
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub text: String,
 }
 
-pub async fn run_client(name: &str, server_address: &str, server_port: u16) {
-    let server_url = format!("http://{}:{}", server_address, server_port);
-    let server_url_clone = server_url.clone();
-    let mut rl = Editor::<(), rustyline::history::DefaultHistory>::new().unwrap();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserList {
+    pub users: Vec<User>,
+    pub count: usize,
+}
 
-    thread::spawn(move || {
-        loop {
-            match reqwest::blocking::get(format!("{}/messages", server_url_clone)) {
-                Ok(mut resp) => {
-                    let mut t = term::stdout().unwrap();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub name: String,
+}
 
-                    if resp.status().is_success() {
-                        let mut content = String::new();
-                        use std::io::Read;
-                        if resp.read_to_string(&mut content).is_ok() {
-                            t.fg(term::color::GREEN).unwrap();
-                            write!(t, "{}", content).unwrap();
-                            t.reset().unwrap();
-                        }
-                    } else if resp.status().is_server_error() {
-                        t.fg(term::color::RED).unwrap();
-                        writeln!(t, "Server error! Status: {:?}", resp.status()).unwrap();
-                        t.reset().unwrap();
-                    } else {
-                        t.fg(term::color::CYAN).unwrap();
-                        writeln!(t, "Something else happened. Status: {:?}", resp.status())
-                            .unwrap();
-                        t.reset().unwrap();
-                    }
-                }
-                Err(e) => {
-                    let mut t = term::stdout().unwrap();
-                    t.fg(term::color::RED).unwrap();
-                    writeln!(t, "Connection error: {:?}", e).unwrap();
-                    t.reset().unwrap();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+pub async fn run_client(server_address: &str, server_port: u16, name: Option<String>) {
+    let client_name = name.unwrap_or_else(generate_random_name);
+    let ws_url = format!("ws://{}:{}/room/1", server_address, server_port);
+
+    println!("Connecting to chat server as {}...", client_name);
+
+    let (ws_stream, _) = connect_async(&ws_url)
+        .await
+        .expect("Failed to connect to server");
+
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    let _tx_clone = tx.clone();
+    let client_name_clone = client_name.clone();
+
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let message = Message {
+                text: format!("{}: {}", client_name_clone, msg),
+            };
+            let json = serde_json::to_string(&message).expect("Failed to serialize message");
+            ws_sender
+                .send(WsMessage::Text(json.into()))
+                .await
+                .expect("Failed to send message");
         }
     });
 
-    println!("Start Chat as {:?} connecting to {}", name, server_url);
-    loop {
-        let mut who = String::from(name);
-        who.push_str(": ");
-        let readline = rl.readline(who.as_str());
-        match readline {
-            Ok(line) => {
-                let client = reqwest::Client::new();
-                let mut whom = String::from(name);
-                whom.push_str(": ");
-                whom.push_str(&line.clone());
-
-                let message = Message { text: whom.clone() };
-
-                match client
-                    .post(format!("{}/room/1", server_url))
-                    .json(&message)
-                    .send()
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(e) => {
+    let _tx_clone = tx.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = ws_receiver.next().await {
+            match msg {
+                Ok(WsMessage::Text(text)) => {
+                    // Try to parse as user list first
+                    if let Ok(user_list) = serde_json::from_str::<UserList>(&text) {
                         let mut t = term::stdout().unwrap();
-                        t.fg(term::color::RED).unwrap();
-                        writeln!(t, "Failed to send message: {:?}", e).unwrap();
+                        t.fg(term::color::BLUE).unwrap();
+                        writeln!(t, "=== Users online: {} ===", user_list.count).unwrap();
+                        for user in user_list.users {
+                            writeln!(t, "  {}", user.name).unwrap();
+                        }
+                        writeln!(t, "========================").unwrap();
+                        t.reset().unwrap();
+                    } else {
+                        // Regular chat message
+                        let mut t = term::stdout().unwrap();
+                        t.fg(term::color::GREEN).unwrap();
+                        writeln!(t, "{}", text).unwrap();
                         t.reset().unwrap();
                     }
                 }
+                Ok(WsMessage::Close(_)) => {
+                    println!("Server closed connection");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("WebSocket error: {}", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    run_chat_tui(tx, &client_name).await;
+}
+
+fn generate_random_name() -> String {
+    let adjectives = [
+        "Happy", "Quick", "Silent", "Brave", "Clever", "Swift", "Bright", "Calm",
+    ];
+    let nouns = [
+        "Panda", "Eagle", "Tiger", "Wolf", "Fox", "Bear", "Lion", "Hawk",
+    ];
+
+    let adj = adjectives[rand::random::<usize>() % adjectives.len()];
+    let noun = nouns[rand::random::<usize>() % nouns.len()];
+    let number = rand::random::<u32>() % 1000;
+
+    format!("{}{}{}", adj, noun, number)
+}
+
+async fn run_chat_tui(tx: mpsc::UnboundedSender<String>, client_name: &str) {
+    let mut rl = Editor::<(), rustyline::history::DefaultHistory>::new().unwrap();
+
+    println!(
+        "Chat started as {}. Type your messages and press Enter.",
+        client_name
+    );
+    println!("Press Ctrl+C to exit.");
+
+    loop {
+        let readline = rl.readline(&format!("{}: ", client_name));
+        match readline {
+            Ok(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                if tx.send(line).is_err() {
+                    eprintln!("Failed to send message");
+                    break;
+                }
             }
             Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
+                println!("Exiting chat...");
                 break;
             }
             Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
+                println!("Exiting chat...");
                 break;
             }
             Err(err) => {
@@ -226,229 +276,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_to_server() {
+    async fn test_random_name_generation() {
+        let name1 = generate_random_name();
+        let name2 = generate_random_name();
+
+        // Names should be strings
+        assert!(!name1.is_empty());
+        assert!(!name2.is_empty());
+
+        // Names should likely be different (very high probability)
+        // We don't require them to be different since it's random, but they usually will be
+        println!("Generated names: {}, {}", name1, name2);
+
+        // Name should contain alphanumeric characters
+        assert!(name1.chars().all(|c| c.is_alphanumeric()));
+        assert!(name2.chars().all(|c| c.is_alphanumeric()));
+    }
+
+    #[tokio::test]
+    async fn test_websocket_url_construction() {
         let address = "127.0.0.1";
-        let port = 12348; // Use different port
-        let server_url = format!("http://{}:{}", address, port);
+        let port = 8080;
+        let ws_url = format!("ws://{}:{}/room/1", address, port);
 
-        // Start a mock server
-        let server_handle = tokio::spawn(async move {
-            let app = axum::Router::new()
-                .route("/messages", get(|| async { "No messages yet\n" }))
-                .route(
-                    "/room/1",
-                    post(|| async { axum::http::StatusCode::CREATED }),
-                );
+        assert_eq!(ws_url, "ws://127.0.0.1:8080/room/1");
 
-            let listener = tokio::net::TcpListener::bind(format!("{}:{}", address, port))
-                .await
-                .unwrap();
-            axum::serve(listener, app).await.unwrap();
-        });
+        // Test URL parsing
+        let url = Url::parse(&ws_url);
+        assert!(url.is_ok());
 
-        // Give server time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let parsed_url = url.unwrap();
+        assert_eq!(parsed_url.scheme(), "ws");
+        assert_eq!(parsed_url.host_str().unwrap(), "127.0.0.1");
+        assert_eq!(parsed_url.port().unwrap(), 8080);
+        assert_eq!(parsed_url.path(), "/room/1");
+    }
 
-        // Test client connection by making HTTP requests
-        let client = reqwest::Client::new();
+    #[tokio::test]
+    async fn test_client_message_formatting() {
+        let client_name = "Alice";
+        let message_text = "Hello everyone!";
 
-        // Test GET messages endpoint
-        let response = client.get(&format!("{}/messages", server_url)).send().await;
+        let formatted_message = format!("{}: {}", client_name, message_text);
+        assert_eq!(formatted_message, "Alice: Hello everyone!");
 
-        assert!(response.is_ok());
-        let response = response.unwrap();
-        assert!(response.status().is_success());
-
-        // Test POST message endpoint
         let message = Message {
-            text: "TestClient: Hello".to_string(),
+            text: formatted_message.clone(),
         };
 
-        let response = client
-            .post(&format!("{}/room/1", server_url))
-            .json(&message)
-            .send()
-            .await;
-
-        assert!(response.is_ok());
-        let response = response.unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
-
-        // Stop server
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_client_disconnect_handling() {
-        let address = "127.0.0.1";
-        let port = 12349; // Use different port
-        let server_url = format!("http://{}:{}", address, port);
-
-        // Start a mock server that tracks connections
-        let server_handle = tokio::spawn(async move {
-            let app = axum::Router::new()
-                .route("/messages", get(|| async { "Test messages\n" }))
-                .route(
-                    "/room/1",
-                    post(|| async { axum::http::StatusCode::CREATED }),
-                );
-
-            let listener = tokio::net::TcpListener::bind(format!("{}:{}", address, port))
-                .await
-                .unwrap();
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Give server time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let client = reqwest::Client::new();
-
-        // Simulate client connecting and making requests
-        for _i in 0..3 {
-            let response = client.get(&format!("{}/messages", server_url)).send().await;
-
-            assert!(response.is_ok());
-            assert!(response.unwrap().status().is_success());
-
-            // Small delay between requests
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
-
-        // Simulate disconnection by dropping the client
-        drop(client);
-
-        // Give time for connection to be fully closed
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Create new client to verify server is still running
-        let new_client = reqwest::Client::new();
-        let response = new_client
-            .get(&format!("{}/messages", server_url))
-            .send()
-            .await;
-
-        assert!(response.is_ok());
-        assert!(response.unwrap().status().is_success());
-
-        // Stop server
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_client_connection_error_handling() {
-        let address = "127.0.0.1";
-        let port = 12350; // Use port that won't have a server running
-        let server_url = format!("http://{}:{}", address, port);
-
-        let client = reqwest::Client::new();
-
-        // Test connection to non-existent server
-        let response = client.get(&format!("{}/messages", server_url)).send().await;
-
-        assert!(response.is_err());
-
-        // Test POST to non-existent server
-        let message = Message {
-            text: "TestClient: Hello".to_string(),
-        };
-
-        let response = client
-            .post(&format!("{}/room/1", server_url))
-            .json(&message)
-            .send()
-            .await;
-
-        assert!(response.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_client_multiple_connections() {
-        let address = "127.0.0.1";
-        let port = 12351; // Use different port
-        let server_url = format!("http://{}:{}", address, port);
-
-        // Start a mock server
-        let server_handle = tokio::spawn(async move {
-            let app = axum::Router::new()
-                .route("/messages", get(|| async { "Server messages\n" }))
-                .route(
-                    "/room/1",
-                    post(|| async { axum::http::StatusCode::CREATED }),
-                );
-
-            let listener = tokio::net::TcpListener::bind(format!("{}:{}", address, port))
-                .await
-                .unwrap();
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Give server time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Create multiple clients
-        let client1 = reqwest::Client::new();
-        let client2 = reqwest::Client::new();
-        let client3 = reqwest::Client::new();
-
-        // All clients should be able to connect
-        let response1 = client1
-            .get(&format!("{}/messages", server_url))
-            .send()
-            .await;
-        let response2 = client2
-            .get(&format!("{}/messages", server_url))
-            .send()
-            .await;
-        let response3 = client3
-            .get(&format!("{}/messages", server_url))
-            .send()
-            .await;
-
-        assert!(response1.is_ok());
-        assert!(response2.is_ok());
-        assert!(response3.is_ok());
-
-        assert!(response1.unwrap().status().is_success());
-        assert!(response2.unwrap().status().is_success());
-        assert!(response3.unwrap().status().is_success());
-
-        // All clients should be able to post messages
-        let message1 = Message {
-            text: "Client1: Hello".to_string(),
-        };
-        let message2 = Message {
-            text: "Client2: Hello".to_string(),
-        };
-        let message3 = Message {
-            text: "Client3: Hello".to_string(),
-        };
-
-        let post1 = client1
-            .post(&format!("{}/room/1", server_url))
-            .json(&message1)
-            .send()
-            .await;
-        let post2 = client2
-            .post(&format!("{}/room/1", server_url))
-            .json(&message2)
-            .send()
-            .await;
-        let post3 = client3
-            .post(&format!("{}/room/1", server_url))
-            .json(&message3)
-            .send()
-            .await;
-
-        assert!(post1.is_ok());
-        assert!(post2.is_ok());
-        assert!(post3.is_ok());
-
-        assert_eq!(post1.unwrap().status(), reqwest::StatusCode::CREATED);
-        assert_eq!(post2.unwrap().status(), reqwest::StatusCode::CREATED);
-        assert_eq!(post3.unwrap().status(), reqwest::StatusCode::CREATED);
-
-        // Stop server
-        server_handle.abort();
+        assert_eq!(message.text, "Alice: Hello everyone!");
     }
 }
