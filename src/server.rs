@@ -475,7 +475,7 @@ async fn run_tui(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::time::sleep;
 
     #[tokio::test]
