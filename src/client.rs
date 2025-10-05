@@ -6,25 +6,25 @@ use std::io::Write;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
-use crate::shared::{Message, UserList, ClientMessage, ServerMessage, ChatError, ChatResult};
+use crate::shared::{ClientMessage, ServerMessage};
 
 /// Runs the chat client and connects to the specified server.
-/// 
+///
 /// This function establishes a WebSocket connection to the chat server,
 /// handles user input, and displays incoming messages in real-time.
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `server_address` - The IP address or hostname of the chat server
 /// * `server_port` - The port number the server is listening on
 /// * `name` - Optional username for the client. If None, a random name is generated.
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```rust
 /// // Connect with a specific name
 /// run_client("127.0.0.1", 12345, Some("Alice".to_string())).await;
-/// 
+///
 /// // Connect with a random name
 /// run_client("127.0.0.1", 12345, None).await;
 /// ```
@@ -43,7 +43,9 @@ pub async fn run_client(server_address: &str, server_port: u16, name: Option<Str
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     // Send initial connection message with user name
-    let connect_msg = ClientMessage::Connect { name: client_name.clone() };
+    let connect_msg = ClientMessage::Connect {
+        name: client_name.clone(),
+    };
     let json = serde_json::to_string(&connect_msg).expect("Failed to serialize connect message");
     ws_sender
         .send(WsMessage::Text(json.into()))
@@ -51,7 +53,6 @@ pub async fn run_client(server_address: &str, server_port: u16, name: Option<Str
         .expect("Failed to send connect message");
 
     let _tx_clone = tx.clone();
-    let client_name_clone = client_name.clone();
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -182,6 +183,7 @@ async fn run_chat_tui(tx: mpsc::UnboundedSender<String>, client_name: &str) {
 mod tests {
     use super::*;
 
+    use crate::shared::Message;
     use url::Url;
 
     #[tokio::test]

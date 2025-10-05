@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Custom error types for the chat application
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum ChatError {
     #[error("WebSocket connection error: {0}")]
     WebSocketError(String),
@@ -29,7 +30,7 @@ pub struct Message {
 /// Represents a list of users currently connected to the chat
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Represents the list of users currently connected to the chat.
-/// 
+///
 /// This structure is used to send user list updates to clients,
 /// containing both the user count and the list of user information.
 pub struct UserList {
@@ -40,7 +41,7 @@ pub struct UserList {
 }
 
 /// A serializable version of User for transmission over the network.
-/// 
+///
 /// This struct contains only the user information that needs to be
 /// sent to clients, excluding sensitive data like the full UUID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +52,7 @@ pub struct SerializableUser {
 
 /// Represents a user connected to the chat server
 /// Represents a user in the chat system.
-/// 
+///
 /// Each user has a unique ID, display name, and connection timestamp.
 /// The user ID is automatically generated when the user is created.
 #[derive(Debug, Clone)]
@@ -101,6 +102,7 @@ impl From<&User> for SerializableUser {
 
 impl Message {
     /// Create a new message with the given text
+    #[allow(dead_code)]
     pub fn new(text: String) -> Self {
         Self { text }
     }
